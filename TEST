@@ -1116,8 +1116,8 @@ contains
     dom%w = 0.0
 
     ! turbulence quantities (k-epsilon)
-    dom%tke = 1e-8
-    dom%td_eps = 1e-8
+    dom%tke = 1.25e-7
+    dom%td_eps = 1.0e-9
     dom%nut = 0.09 * dom%tke**2 / dom%td_eps
 
     deallocate (z_, u_, t_, c_)
@@ -1274,7 +1274,7 @@ contains
 
   end subroutine set_turbulence
 
-  
+
   subroutine update_turbulence(dom, dt_sec)
     !
     ! input  : u, t, rho
@@ -1369,73 +1369,91 @@ contains
           CZ= 0.01D0
         ENDIF
 
-        u_starS = SQRT(1.25 * CZ * wind10**2 / rho(i,k_srf))
+        u_starS = SQRT(1.25 * CZ * wind10**2 / rho(i,dom%k_srf))
 
         ! bottom shear velocity usign simple model
-        FRIC = 100
+        FRIC = 100.0
         GC2 = gravity / (FRIC**2)
-        u_starBS = SQRT(GC2) * ABS(0.5* (u(i, k_srf) + u(i-1, k_srf)))
+        u_starBS = SQRT(GC2) * ABS(0.5* (u(i, dom%k_srf) + u(i-1, dom%k_srf)))
 
         ! setting surface tke and td_eps
         depth(i) = dom%z_srf - dom%z_bed(i)
-        tke(i, k_srf) = ( 3.33*(u_starS**2 + u_starBS**2) )
-        td_eps(i, k_srf) = (u_starS**3 + u_starBS**3)*5.0 / depth(i)
+        tke(i, dom%k_srf) = ( 3.33*(u_starS**2 + u_starBS**2) )
+        td_eps(i, dom%k_srf) = (u_starS**3 + u_starBS**3)*5.0 / depth(i)
 
-        ! intemediate tke and td_eps
+        ! intermediate tke and td_eps
         do k = dom%kc_bot(i)+1, dom%k_srf-1
           ! shear production and buoyoncy
-          buoy_k = MAX( dom%dmz(i,k)*gravity*(dom%rho(i,k-1) - dom%rho(i,k))/(rho_water*dom%dzs(k)), 0.0 )
-          Prdk = dom%dmz(i,k)*( 0.5*(dom%u(i,k) + dom%u(i-1,k) - dom%u(i,k-1) - dom%u(i-1,k-1)) / (dom%dzs(k) + dom%dzs(k-1)) )**2
-          Prhe = 10.0* GC2**1.25 *ABS( 0.5*(dom%u(i,k) + dom%u(i-1,k)))**4 / (0.5*dom%dxs(i))**2
-          Prhk = GC2 / (0.5*dom%dxs(i)) * ABS(0.5 * (dom%u(i,k) + dom%u(i-1,k)))**3
+          buoy_k = MAX( dom%dmz(i,k)*gravity*(dom%rho(i,k-1) - dom%rho(i,k))/(rho_water*dom%dz(k)), 0.0 )
+          Prdk = dom%dmz(i,k)*( 0.5*(dom%u(i,k) + dom%u(i-1,k) - dom%u(i,k-1) - dom%u(i-1,k-1)) / (dom%dz(k)*0.5 + dom%dz(k-1)*0.5) )**2
+          Prhe = 10.0* GC2**1.25 *ABS( 0.5*(dom%u(i,k) + dom%u(i-1,k)))**4.0 / (0.5*dom%au(i,k)/dom%dz(k))**2
+          Prhk = GC2 / (0.5*dom%au(i,k)/dom%dz(k)) * ABS(0.5 * (dom%u(i,k) + dom%u(i-1,k)))**3
 
           ! update (Production - Dissipasion)
           Unst = Prdk - dom%td_eps(i,k)
-          Unse = 1.44 * dom%td_eps(i,k)/dom%tke(i,k)*Prdk - 1.92 * (dom%td_eps(i, k)/dom%tke(i,k) * dom%td_eps(i, k))
+          Unse = 1.44 * dom%td_eps(i,k)/dom%tke(i,k)*Prdk - 1.92 * (dom%td_eps(i,k)/dom%tke(i,k) * dom%td_eps(i, k))
 
           dom%tke(i,k) = dom%tke(i,k) + dt_sec*(Unst + Prhk - buoy_k)
           dom%td_eps(i,k) = dom%td_eps(i,k) + dt_sec*(Unse + Prhe)
+          !print '(2i5, 3f30.10)',  i, k, Prdk, buoy_k, dom%tke(i, k)
         end do
 
         ! bottom tke and td_eps
         u_starB = SQRT(GC2) * ABS( 0.5 * (u(i,dom%kc_bot(i)) + u(i-1,dom%kc_bot(i))) )
-        dom%tke(i,k) = 0.5 *( 3.33*u_starB**2 + tke(i,dom%kc_bot(i)))
-        dom%td_eps(i,k) = 0.5 *( u_starB**3*5.0/dom%dzs(k) + td_eps(i,dom%kc_bot(i)) )
+        dom%tke(i,dom%kc_bot(i)) = 0.5 *( 3.33*u_starB**2 + tke(i,dom%kc_bot(i)))
+        dom%td_eps(i,dom%kc_bot(i)) = 0.5 *( u_starB**3*5.0/dom%dzs(dom%kc_bot(i)) + td_eps(i,dom%kc_bot(i)) )
+
+        dom%tke(i,dom%kc_bot(i)-1) = dom%tke(i,dom%kc_bot(i))
+        dom%td_eps(i,dom%kc_bot(i)-1) = dom%td_eps(i,dom%kc_bot(i))
 
       enddo
 
       ! update vertical diffusion
       do i = 1, nx
         do k = dom%kc_bot(i), dom%k_srf-1
-          flux_up_tke = dom%dmz(i,k) * (dom%tke(i,k+1) - dom%tke(i,k))/( 0.5*(dom%dzs(k+1)+dom%dzs(k)) )
-          flux_down_tke = dom%dmz(i,k-1) * (dom%tke(i,k) - dom%tke(i,k-1))/( 0.5*(dom%dzs(k)+dom%dzs(k-1)) )
-          flux_up_e = dom%dmz(i,k) * (dom%td_eps(i,k+1) - dom%td_eps(i,k))/( 0.5*(dom%dzs(k+1)+dom%dzs(k)) )
-          flux_down_e = dom%dmz(i,k-1) * (dom%td_eps(i,k) - dom%td_eps(i,k-1))/( 0.5*(dom%dzs(k)+dom%dzs(k-1)) )
-          diff_tke = (flux_up_tke - flux_down_tke) / dom%aws(i,k)
-          diff_e = (flux_up_e - flux_down_e) / dom%aws(i,k)
+          flux_up_tke = dom%dmz(i,k) * (dom%tke(i,k+1) - dom%tke(i,k))/( 0.5*(dom%dz(k+1)+dom%dz(k)) )
+          flux_down_tke = dom%dmz(i,k-1) * (dom%tke(i,k) - dom%tke(i,k-1))/( 0.5*(dom%dz(k)+dom%dz(k-1)) )
+          flux_up_e = dom%dmz(i,k) * (dom%td_eps(i,k+1) - dom%td_eps(i,k))/( 0.5*(dom%dz(k+1)+dom%dz(k)) )
+          flux_down_e = dom%dmz(i,k-1) * (dom%td_eps(i,k) - dom%td_eps(i,k-1))/( 0.5*(dom%dz(k)+dom%dz(k-1)) )
+          diff_tke = (flux_up_tke - flux_down_tke) / dom%aw(i,k)
+          diff_e = (flux_up_e - flux_down_e) / dom%aw(i,k)
 
-          dom%tke = dom%tke + dt_sec*diff_tke
-          dom%td_eps = dom%td_eps + dt_sec*diff_e
+          dom%tke(i,k) = dom%tke(i,k) + dt_sec*diff_tke
+          dom%td_eps(i,k) = dom%td_eps(i,k) + dt_sec*diff_e
+
+          ! avoid NaNs and non-positive values
+          if (dom%tke(i,k) /= dom%tke(i,k) .or. dom%tke(i,k) <= 0.0) then
+            dom%tke(i,k) = 1.25e-7
+          end if
+          if (dom%td_eps(i,k) /= dom%td_eps(i,k) .or. dom%td_eps(i,k) <= 0.0) then
+            dom%td_eps(i,k) = 1.0e-9
+          end if
+
+        print '(2i5, 3f30.10)',  i, k, dom%nut(i,k), dom%td_eps(i, k), dom%tke(i, k)
+
         enddo
       enddo
 
       ! update eddy viscousity coefficient
       do i = 1, nx
         do k = dom%kc_bot(i), dom%k_srf-1
-          dom%tke = MAX(dom%tke(i,k), 1.25D-7)
-          dom%td_eps = MAX(dom%td_eps(i,k), 1.0e-9)
+          dom%tke(i,k) = MAX(dom%tke(i,k), 1.25D-7)
+          dom%td_eps(i,k) = MAX(dom%td_eps(i,k), 1.0e-9)
           dom%nut(i,k) = 0.09*dom%tke(i,k)**2/td_eps(i,k)
+        !print '(2i5, 3f30.10)',  i, k, dom%nut(i,k), dom%td_eps(i, k), dom%tke(i, k)
         enddo
       enddo
+
 
       ! --- new dmz, dhz, dcz ---
       do i = 1, nx
         do k = dom%kc_bot(i), dom%k_srf-1
           dom%dmz(i,k) = 0.5*(dom%nut(i,k) + dom%nut(i,k-1))
           dom%dmz(i,k) = MAX(1.4e-6, dom%dmz(i,k))
-          dom%dmz(i,k) = MIN(0.2, dom%dmz(i,k))
+          dom%dmz(i,k) = MIN(2.0e-1, dom%dmz(i,k))
           dom%dhz(i,k) = MAX(1.4e-7, 0.14*dom%dmz(i,k))
           dom%dcz(i,k) = MAX(1.4e-7, 0.14*dom%dmz(i,k))
+         !print '(2i5, 3f30.10)',  i, k, dom%dmz(i, k)
         enddo
       enddo
 
@@ -3584,6 +3602,65 @@ enddo
 
   end subroutine read_snap
 
+
+  subroutine write_monitor(dom, time_day)
+    !
+    ! output monitoring data of turbulence variables
+    ! keep logs only for the latest ten timesteps
+    !
+    use mod_parameter, only : rho_water
+
+    implicit none
+
+    type(domain), intent(in) :: dom
+    real, intent(in) :: time_day
+
+    integer, parameter :: nkeep = 3
+    integer :: i, k, nx, nz, k_srf
+    real, pointer :: dxs(:)
+    real :: pg
+    logical, save :: first_call = .true.
+    integer, save :: step_count = 0
+    character(len=128), save :: base_fname
+    character(len=128) :: fname, old_fname
+    logical :: ex
+
+    if (first_call) then
+      base_fname = 'out/'//trim(dom%name)//'/monitor'
+      first_call = .false.
+    endif
+
+    step_count = step_count + 1
+    write(fname,'(a,i6.6,a)') trim(base_fname), step_count, '.log'
+    open(9000, file=fname, status='replace')
+    write(9000,'(a)') 'TIME(days) I K PRESS_GRAD(Pa/m) U W NUT TKE TD_EPS'
+
+    nx = dom%nx; nz = dom%nz; k_srf = dom%k_srf
+    dxs => dom%dxs
+
+    do i=1, nx-1
+      do k=dom%kc_bot(i), k_srf
+        pg = -(dom%p(i+1,k) - dom%p(i,k))/(dxs(i)*rho_water)
+        write(9000,'(f10.4,2i6,6e15.7)') time_day, i, k, pg, &
+          dom%u(i,k), dom%w(i,k), &
+          dom%nut(i,k), dom%tke(i,k), dom%td_eps(i,k)
+      enddo
+    enddo
+
+    close(9000)
+
+    if (step_count > nkeep) then
+      write(old_fname,'(a,i6.6,a)') trim(base_fname), step_count-nkeep, '.log'
+      inquire(file=trim(old_fname), exist=ex)
+      if (ex) then
+        open(9001, file=trim(old_fname), status='old')
+        close(9001, status='delete')
+      endif
+    endif
+
+  end subroutine write_monitor
+
+
 end module mod_utility
 
 
@@ -3633,7 +3710,7 @@ contains
     real, pointer, dimension(:,:) :: rho, p, dmx, dmz
 
     integer :: i, j, k
-    real :: rhs, fp, fm, fxm, fxp, fzm, fzp, q_col_, ini_slope, dmzmax
+    real :: rhs, fp, fm, fxm, fxp, fzm, fzp, q_col_, ini_slope, dmzmax, PG
     real, allocatable :: u(:,:), w(:,:)
     real, allocatable :: slope(:)
 
@@ -3735,12 +3812,14 @@ contains
 
         ! pressure gradient
         if (pressure_grad) then
-          fp = vols(i,k)/dom%dxs(i)
           if (k == k_srf) then
-            rhs = rhs - fp * (p(i+1,k) - p(i,k)) / rho_water
+            PG = (p(i+1,k) - p(i,k))/rho_water/dom%dxs(i)*vols(i,k)
+            rhs = rhs - PG
           else
-            rhs = rhs - fp * ( (p(i+1,k) - p(i,k)) + (p(i+1,k+1) - p(i,k+1)) ) / rho_water
+            PG = ( (p(i+1,k) - p(i,k)) + (p(i+1,k+1) - p(i,k+1)) )/rho_water/dom%dxs(i)*vols(i,k)
+            rhs = rhs - PG
           endif
+        !  print '(2i4, 3f15.5)',  i, k, p(i+1,k), p(i,k), PG
         endif
 
         ! Gravity from river slope
@@ -4386,6 +4465,7 @@ contains
 
         ! new c
         dom%c(i,k,l) = c(i,k,l) + dt_sec*rhs/vol(i,k)
+        dom%c(i,k,l) = max(dom%c(i,k,l), 1.0e-20)
 
       enddo
     enddo
@@ -4599,7 +4679,7 @@ program main
     set_suspended_solids, update_suspended_solids
 
   use mod_utility, only : &
-    check_dt, set_probe, write_timeseries, read_snap, write_snap
+    check_dt, set_probe, write_timeseries, read_snap, write_snap !, write_monitor
 
 #ifdef SCALAR
   use mod_scalar, only : update_scalar
@@ -4752,6 +4832,7 @@ program main
     do i=1, ndom
       call update_density(doms(i))
       call update_turbulence(doms(i), dt_sec)
+    !  call write_monitor(doms(i), time_day)
     enddo
 
     ! output 2d field
