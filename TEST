@@ -1429,7 +1429,7 @@ contains
             dom%td_eps(i,k) = 1.0e-9
           end if
 
-        print '(2i5, 3f30.10)',  i, k, dom%nut(i,k), dom%td_eps(i, k), dom%tke(i, k)
+        !print '(2i5, 3f30.10)',  i, k, dom%nut(i,k), dom%td_eps(i, k), dom%tke(i, k)
 
         enddo
       enddo
@@ -1453,7 +1453,7 @@ contains
           dom%dmz(i,k) = MIN(2.0e-1, dom%dmz(i,k))
           dom%dhz(i,k) = MAX(1.4e-7, 0.14*dom%dmz(i,k))
           dom%dcz(i,k) = MAX(1.4e-7, 0.14*dom%dmz(i,k))
-         !print '(2i5, 3f30.10)',  i, k, dom%dmz(i, k)
+        ! print '(2i5, 3f30.10)',  i, k, dom%dmz(i, k)
         enddo
       enddo
 
@@ -1528,16 +1528,55 @@ contains
         dom%dhz(i,dom%k_srf) = dom%dhz(i,dom%k_srf-1)
         dom%dcz(i,dom%k_srf) = dom%dhz(i,dom%k_srf-1)
 
+
       enddo
     endif
-
-    ! check dhz
-    ! print '(4f15.10)', dom%dhz(10, dom%k_srf-1), dom%dhz(20, dom%k_srf-1), dom%dhz(30, dom%k_srf-1), dom%dhz(40, dom%k_srf-1)
 
     deallocate (depth)
     deallocate (u, w)
 
   end subroutine update_turbulence
+
+
+  subroutine write_exceed_point(dom, it_step, time_day)
+    !
+    ! write log when exceeds threshold
+    !
+    implicit none
+
+    type(domain), intent(in) :: dom
+    integer, intent(in) :: it_step
+    real, intent(in) :: time_day
+
+    real, parameter :: dmz_threshold = 0.01
+    integer, parameter :: unit_no = 9100
+    logical, save :: first_call = .true.
+    character(len=128), save :: fname
+
+    integer :: i, k, nx, k_srf
+
+    if (first_call) then
+      fname = 'out/' // trim(dom%name) // '/exceed_points.csv'
+      open(unit_no, file=fname, status='unknown')
+      write(unit_no,'(a)') &
+        'STEP DAYS I K U W P NUT TKE EPS DMZ'
+      first_call = .false.
+    endif
+
+    nx = dom%nx; k_srf = dom%k_srf
+
+    do i=1, nx
+      do k=dom%kc_bot(i), k_srf-1
+        if (dom%dmz(i,k) > dmz_threshold) then
+          write(unit_no,'(i8,a,f10.4,a,i6,a,i6,a,e15.7,a,e15.7,a,e15.7,a,e15.7,a,e15.7,a,e15.7,a,e15.7)') &
+            it_step, ',', time_day, ',', i, ',', k, ',', dom%u(i,k), ',', dom%w(i,k), ',', dom%p(i,k), ',', &
+            dom%nut(i,k), ',', dom%tke(i,k), ',', dom%td_eps(i,k), ',', dom%dmz(i,k)
+        endif
+      enddo
+    enddo
+
+  end subroutine write_exceed_point
+
 
 end module mod_domain
 
@@ -2141,6 +2180,12 @@ contains
           if (-0.5 <= zeta .and. zeta <= 0.5) &
             f(k) = exp(-0.5*(zeta*3.92)**2)
         enddo
+
+
+        ! no vertical distribution of outflow
+        !f(:) = 0.0
+        !f(kc) = 1.0
+
 
         ! outlet velocity, temperature and suspended solids
         tmp = sum(dom%au(nx,kb:k_srf)*f(kb:k_srf))
@@ -3669,7 +3714,6 @@ module mod_momentum
   implicit none
 
   logical :: pressure_grad=.false.  ! impose(T) or expose(F) pressure gradient
-  logical :: density_inversion=.false. ! impose(T) or expose(F) density inversion
   logical :: gravity_slope=.false.     ! impose(T) or expose(F) gravity from river slope
 
 contains
@@ -3679,7 +3723,7 @@ contains
     implicit none
 
     ! namelist
-    namelist /momentum/ pressure_grad, density_inversion, gravity_slope
+    namelist /momentum/ pressure_grad, gravity_slope
 
     ! loading from namelist file
     open(10, file='namelist.in', status='old')
@@ -3783,15 +3827,6 @@ contains
         fxp = fxp + fp
 
         ! diffusion-z 
-        if (density_inversion) then  ! density inversion mixing
-          dmzmax = 0.2D0             ! set maximum dmz
-          if (k < k_srf) then
-            if (rho(i,k) < rho(i,k+1)) then
-              dmz(i,k) = dmzmax
-            endif
-          endif
-        endif
-
         if (k == k_bot(i)) then
           fm = 0.0
         else
@@ -3816,7 +3851,7 @@ contains
             PG = (p(i+1,k) - p(i,k))/rho_water/dom%dxs(i)*vols(i,k)
             rhs = rhs - PG
           else
-            PG = ( (p(i+1,k) - p(i,k)) + (p(i+1,k+1) - p(i,k+1)) )/rho_water/dom%dxs(i)*vols(i,k)
+            PG = ( (p(i+1,k) - p(i,k)) + (p(i+1,k+1) - p(i,k+1)) )/(rho_water*2*dom%dxs(i))*vols(i,k)
             rhs = rhs - PG
           endif
         !  print '(2i4, 3f15.5)',  i, k, p(i+1,k), p(i,k), PG
@@ -4664,13 +4699,13 @@ program main
     doms, &
     set_geometry, allocate_variables, deallocate_variables, &
     set_initial, update_surface_layer, update_density, &
-    set_turbulence, update_turbulence, write_geo
+    set_turbulence, update_turbulence, write_geo, write_exceed_point
 
   use mod_boundary, only : &
     set_boundary, update_boundary, update_surface, deallocate_boundary
 
   use mod_heat, only : &
-    set_heat, update_meteorology, update_heat, radiation
+    set_heat, update_meteorology, radiation, update_heat
 
   use mod_momentum, only : &
     set_momentum, update_momentum
@@ -4763,6 +4798,7 @@ program main
     call update_boundary(dom, time_day)
     call set_turbulence(dom)
     call update_turbulence(dom, dt_sec)
+    call write_exceed_point(dom, 0, time_day)
     call set_probe(doms(i))
   enddo
 
@@ -4832,6 +4868,7 @@ program main
     do i=1, ndom
       call update_density(doms(i))
       call update_turbulence(doms(i), dt_sec)
+      call write_exceed_point(doms(i), it, time_day)
     !  call write_monitor(doms(i), time_day)
     enddo
 
