@@ -292,8 +292,8 @@ module mod_domain
 
     real, pointer, dimension(:,:) :: &
       rho,    &  ! water density, kg/m3
-      GRAV,   &  ! gravity fro river gradient, 
-      PRG        ! pressure gradient,
+      GRAV,   &  ! gravity from river gradient, 
+      PGX        ! pressure gradient,
 
     real, pointer, dimension(:) :: &
       rho_avg    ! horizontary averaged water density at w-pos, kg/m3
@@ -327,6 +327,7 @@ module mod_domain
       td_eps,  & ! turbulence dissipation rate
       nut        ! eddy viscosity from k-epsilon, m2/s
     logical :: use_kepsilon = .false.
+    logical :: freeslip = .false.
 
     !-- boundary conditions
 
@@ -498,6 +499,9 @@ module mod_domain
     real, pointer ::    &
       x_prb(:),         & ! x of probes, m
       z_prb(:)            ! z of probes, m, (negative value is water surface)
+
+    logical, pointer :: &
+      exceed_logged(:,:) ! exceed logging flag
 
 #ifdef SCALAR
     real, pointer ::     &
@@ -779,6 +783,10 @@ contains
 
     allocate (dom%tke(0:nx+1,0:nz+1), dom%td_eps(0:nx+1,0:nz+1))
     allocate (dom%nut(nx,nz))
+    allocate (dom%PGX(nx,nz))
+
+    allocate (dom%exceed_logged(nx,0:nz))
+    dom%exceed_logged = .false.
 
     allocate (dom%c_sed(0:nx+1,nps))
     dom%c_sed=0.0
@@ -809,10 +817,11 @@ contains
     nullify (dom%u, dom%w, dom%t, dom%c)
 
     ! model variables
-    nullify (dom%p, dom%rho, dom%rho_avg)
+    nullify (dom%p, dom%rho, dom%rho_avg, dom%PGX)
     nullify (dom%dmx, dom%dmz, dom%dhx, dom%dhz, dom%dcx, dom%dcz)
     nullify (dom%tke, dom%td_eps, dom%nut)
     nullify (dom%c_sed)
+    nullify (dom%exceed_logged, dom%c_sed)
 
 #ifdef SCALAR
     nullify (dom%s)
@@ -1251,11 +1260,12 @@ contains
       ll = 0.5,    &  ! strength param of the expornent
       mm = 0.5,    &  ! strength param of the expornent
       nn = 0.5,    &  ! strength param of the expornent
-      dmix = 1e-3     ! vertical diffusivity of mixing zone, m2/s
+      dmix = 1e-2     ! vertical diffusivity of mixing zone, m2/s
     logical :: use_kepsilon = .false.   ! impose(T) or expose(F) k-epsilon 
+    logical :: freeslip = .false.       ! impose(T) or expose(F) freeslip in k-epsilon 
 
     namelist /turbulence/ dmx0, dmz0, dhx0, dhz0, dcx0, dcz0, &
-      ll, mm, nn, dmix, use_kepsilon
+      ll, mm, nn, dmix, use_kepsilon, freeslip
 
     ! loading from namelist file
     open(10, file=trim(dom%fname_nml), status='old')
@@ -1271,6 +1281,7 @@ contains
     dom%ll=ll; dom%mm=mm; dom%nn=nn 
     dom%dmix=dmix
     dom%use_kepsilon=use_kepsilon
+    dom%freeslip=freeslip
 
   end subroutine set_turbulence
 
@@ -1362,7 +1373,7 @@ contains
         IF(WIND10 >= 15.0)THEN
           CZ = 0.0026D0
         ELSEIF(WIND10 >= 4.0)THEN
-          CZ = 0.0005D0*DSQRT(WIND10)
+          CZ = 0.0005D0*SQRT(WIND10)
         ELSEIF(WIND10 >= 0.5)THEN
           CZ= 0.0044D0*WIND10**(-1.15D0)
         ELSE
@@ -1385,8 +1396,10 @@ contains
         do k = dom%kc_bot(i)+1, dom%k_srf-1
           ! shear production and buoyoncy
           buoy_k = MAX( dom%dmz(i,k)*gravity*(dom%rho(i,k-1) - dom%rho(i,k))/(rho_water*dom%dz(k)), 0.0 )
-          Prdk = dom%dmz(i,k)*( 0.5*(dom%u(i,k) + dom%u(i-1,k) - dom%u(i,k-1) - dom%u(i-1,k-1)) / (dom%dz(k)*0.5 + dom%dz(k-1)*0.5) )**2
-          Prhe = 10.0* GC2**1.25 *ABS( 0.5*(dom%u(i,k) + dom%u(i-1,k)))**4.0 / (0.5*dom%au(i,k)/dom%dz(k))**2
+          Prdk = dom%dmz(i,k)*( 0.5*(dom%u(i,k) + dom%u(i-1,k) - dom%u(i,k-1) - dom%u(i-1,k-1)) &
+          / (dom%dz(k)*0.5 + dom%dz(k-1)*0.5) )**2
+          Prhe = 10.0* GC2**1.25 *ABS( 0.5*(dom%u(i,k) + dom%u(i-1,k)))**4.0 &
+          / (0.5*dom%au(i,k)/dom%dz(k))**2
           Prhk = GC2 / (0.5*dom%au(i,k)/dom%dz(k)) * ABS(0.5 * (dom%u(i,k) + dom%u(i-1,k)))**3
 
           ! update (Production - Dissipasion)
@@ -1444,7 +1457,6 @@ contains
         enddo
       enddo
 
-
       ! --- new dmz, dhz, dcz ---
       do i = 1, nx
         do k = dom%kc_bot(i), dom%k_srf-1
@@ -1453,6 +1465,14 @@ contains
           dom%dmz(i,k) = MIN(2.0e-1, dom%dmz(i,k))
           dom%dhz(i,k) = MAX(1.4e-7, 0.14*dom%dmz(i,k))
           dom%dcz(i,k) = MAX(1.4e-7, 0.14*dom%dmz(i,k))
+
+          ! mixing for unstable zone
+          if (dom%rho(i,k+1) > dom%rho(i,k)) then
+          !  dom%dmz(i,k) = dom%dmix
+            dom%dhz(i,k) = dom%dmix
+            dom%dcz(i,k) = dom%dmix
+          endif
+
         ! print '(2i5, 3f30.10)',  i, k, dom%dmz(i, k)
         enddo
       enddo
@@ -1466,6 +1486,18 @@ contains
         dom%dhz(i,dom%k_srf) = dom%dhz(i,dom%k_srf-1)
         dom%dcz(i,dom%k_srf) = dom%dhz(i,dom%k_srf-1)
       enddo
+
+      if (dom%freeslip) then
+        do i=1, nx
+          dom%dmz(i,dom%kc_bot(i)) = 0.0
+          dom%dhz(i,dom%kc_bot(i)) = 0.0
+          dom%dcz(i,dom%kc_bot(i)) = 0.0
+
+          dom%dmz(i,dom%k_srf) = 0.0
+          dom%dhz(i,dom%k_srf) = 0.0
+          dom%dcz(i,dom%k_srf) = 0.0
+        enddo        
+      endif 
 
     else
       ! --- from Richardson number function ---
@@ -1513,7 +1545,7 @@ contains
 
           ! mixing for unstable zone
           if (dom%rho(i,k+1) > dom%rho(i,k)) then
-            dom%dmz(i,k) = dom%dmix
+          !  dom%dmz(i,k) = dom%dmix
             dom%dhz(i,k) = dom%dmix
             dom%dcz(i,k) = dom%dmix
           endif
@@ -1548,7 +1580,9 @@ contains
     integer, intent(in) :: it_step
     real, intent(in) :: time_day
 
+    real, parameter :: nut_threshold = 10.0
     real, parameter :: dmz_threshold = 0.01
+    real, parameter :: PGX_threshold = 1.0
     integer, parameter :: unit_no = 9100
     logical, save :: first_call = .true.
     character(len=128), save :: fname
@@ -1559,7 +1593,7 @@ contains
       fname = 'out/' // trim(dom%name) // '/exceed_points.csv'
       open(unit_no, file=fname, status='unknown')
       write(unit_no,'(a)') &
-        'STEP DAYS I K U W P NUT TKE EPS DMZ'
+        'STEP, DAYS, I, K, U, W, P, NUT, TKE, EPS, DMX, DMZ, PGX'
       first_call = .false.
     endif
 
@@ -1567,11 +1601,13 @@ contains
 
     do i=1, nx
       do k=dom%kc_bot(i), k_srf-1
-        if (dom%dmz(i,k) > dmz_threshold) then
-          write(unit_no,'(i8,a,f10.4,a,i6,a,i6,a,e15.7,a,e15.7,a,e15.7,a,e15.7,a,e15.7,a,e15.7,a,e15.7)') &
+        if (dom%nut(i,k) <= nut_threshold) cycle
+        if (.not. dom%exceed_logged(i,k)) then
+          write(unit_no,'(i8,a,f10.4,a,i6,a,i6,a,e15.7,a,e15.7,a,e15.7,a,e15.7,a,e15.7,a,e15.7,a,e15.7,a,e15.7,a,e15.7)') &
             it_step, ',', time_day, ',', i, ',', k, ',', dom%u(i,k), ',', dom%w(i,k), ',', dom%p(i,k), ',', &
-            dom%nut(i,k), ',', dom%tke(i,k), ',', dom%td_eps(i,k), ',', dom%dmz(i,k)
-        endif
+            dom%nut(i,k), ',', dom%tke(i,k), ',', dom%td_eps(i,k), ',', dom%dmx(i,k), ',', dom%dmz(i,k), ',', dom%PGX(i,k)
+          dom%exceed_logged(i,k) = .true.
+        end if
       enddo
     enddo
 
@@ -1988,6 +2024,15 @@ contains
     real :: tmp, eps, delta, zeta
     real, allocatable :: array(:), f(:)
 
+    character(3) :: inflowtype
+    ! namelist
+    namelist /inflow/ inflowtype
+
+    ! loading from namelist file
+    open(10, file='namelist.in', status='old')
+    read(10, nml=inflow)
+    close(10)
+
     !--- pointer and allocate arrays ---------------
     nz=dom%nz; k_srf=dom%k_srf; z_srf=dom%z_srf; kc_bot=>dom%kc_bot; k_bot=>dom%k_bot
     z=>dom%z; zc=>dom%zc; dz=>dom%dz; rho_=>dom%rho_avg; z_bed=>dom%z_bed
@@ -2033,7 +2078,85 @@ contains
     kc = -1
     z_in = -999.
 
-    ! Set river inflow level -> average depth (2025/06/05)
+  SELECT CASE (inflowtype)
+
+  CASE ('EDI')        ! Equidensity Inflow, normal distributed
+    ! search equidensity zone from layer averaga density
+    if (rho_in <= rho_(k_srf-1)) then
+      z_in = z_srf
+      kc = k_srf
+    else if (rho_(kc_min) <= rho_in) then
+      z_in = zc(kc_min)
+      kc = kc_min
+    else
+      do k=k_srf-1, kc_min+1, -1
+        if (rho_(k-1) >= rho_in .and. rho_in >= rho_(k)) then
+          tmp = (rho_in - rho_(k))/(rho_(k-1) - rho_(k) + 1.e-8)
+          z_in = tmp*z(k-1) + (1.0 - tmp)*z(k)
+          kc = k
+          exit
+        endif
+      enddo
+    endif
+
+    if (z_in < dom%z_in_low) then
+      z_in = dom%z_in_low
+      dom%z_in = z_in
+      do k=kc_min, k_srf
+        if (zc(k-1) <= z_in .and. z_in <= zc(k)) then
+          kc = k
+          exit
+        endif
+      enddo
+    endif
+
+    if (kc < 0) then
+      print *, 'error: cant find kc, in subroutine update_inflow'
+      stop
+    endif
+
+    ! normalized density gradient, 1/m
+    eps = -(rho_(kc) - rho_(kc-1))/(z(kc) - z(kc-1))/rho_water
+    eps = max(1.e-6, eps)
+
+    ! flow depth of 2d jet, m
+    delta = abs(dom%q_in) / (dom%fr_in*dom%b_in*sqrt(eps*gravity))
+    delta = min(max(dz(kc), sqrt(delta)), z(nz)-z(0))
+
+    ! velocity profile function
+    f(:) = 0.0
+    do k=1, k_srf
+      zeta = (zc(k) - z_in)/delta
+      if (-0.5 <= zeta .and. zeta <= 0.5) &
+        f(k) = exp(-0.5*(zeta*3.92)**2)
+    enddo
+
+    ! inlet velocity
+    tmp = 1.e-8
+    do k=1, k_srf
+      i = dom%i_inlet(k)
+      tmp = tmp + dom%au(i,k)*f(k)
+    enddo
+    do k=1, k_srf
+      i = dom%i_inlet(k)
+      dom%u(i,k) = dom%q_in*f(k)/tmp
+    enddo
+
+    ! inlet temerature and SS
+    do k=1, k_srf
+      i = dom%i_inlet(k)
+      dom%t(i,k) = dom%t_in
+      dom%c(i,k,:) = dom%c_in(:)
+#ifdef SCALAR
+      dom%s(i,k) = dom%s_in
+#endif
+    enddo
+
+    ! total flowrate
+    dom%qtot_in = dom%q_in
+
+  CASE ('RID')      ! Distributed River Inflow
+    ! Set river inflow level at average depth
     i = dom%i_inlet(k_srf)
     z_in = z_srf - (z_srf - z_bed(i))/2
     kc = (k_srf + kc_bot(i))/2
@@ -2077,6 +2200,41 @@ contains
 
     ! total flowrate
     dom%qtot_in = dom%q_in
+
+  CASE ('RI1')   ! 1 cell River Inflow due to density selection
+    ! determine inflow layer from inlet colomn density
+    kc = k_srf
+    i = dom%i_inlet(kc)
+    do while (rho_in > rho_(kc) .and. kc > k_bot(i))
+      kc = kc - 1
+      i = dom%i_inlet(kc)
+    enddo
+    z_in = z(kc)
+    delta = dz(kc)
+
+    ! clear and update horizontal velocity into selected layer
+    !i = dom%i_inlet(k)
+    !do k=kc_bot(i), k_srf
+    !  dom%u(i,k) = 0.0
+    !enddo
+    i = dom%i_inlet(kc)
+    dom%u(i,kc) = dom%q_in/dom%au(i,kc)
+
+
+    ! inlet temerature and SS
+    do k=1, k_srf
+      i = dom%i_inlet(k)
+      dom%t(i,k) = dom%t_in
+      dom%c(i,k,:) = dom%c_in(:)
+#ifdef SCALAR
+      dom%s(i,k) = dom%s_in
+#endif
+    enddo
+
+    ! total flowrate
+    dom%qtot_in = dom%q_in
+
+  END SELECT
 
     !--- pointer and de-allocate arrays ---
     dom%z_in=z_in; dom%delta_in=delta/1.00; dom%rho_in=rho_in
@@ -3590,6 +3748,14 @@ do i=1, nx
   enddo
 enddo
 
+do i=0, nx+1
+  do k=0, nz+1
+    do j=1,nps
+      if (abs(dom%c(i,k,j)) < 1e-20) dom%c(i,k,j) = 0.0
+    enddo
+  enddo
+enddo
+
     write(10,fmt) ((dom%u(i,k),i=0,nx),k=1,nz)
     write(10,fmt) ((dom%w(i,k),i=1,nx),k=0,nz)
     write(10,fmt) ((dom%rho(i,k),i=0,nx+1),k=0,nz+1)
@@ -3598,6 +3764,8 @@ enddo
     write(10,fmt) (((dom%c(i,k,j),i=0,nx+1),k=0,nz+1),j=1,nps)
     write(10,fmt) ((dom%c_sed(i,j),i=0,nx+1),j=1,nps)
     write(10,fmt) ((dom%dhz(i,k),i=1,nx),k=0,nz)
+    write(10,fmt) ((dom%dmx(i,k),i=1,nx),k=1,nz)
+    write(10,fmt) ((dom%dmz(i,k),i=1,nx),k=0,nz)
 #ifdef SCALAR
     write(10,fmt) ((dom%s(i,k),i=0,nx+1),k=0,nz+1)
 #endif
@@ -3639,6 +3807,8 @@ enddo
     read(10,*) dom%c
     read(10,*) dom%c_sed
     read(10,*) dom%dhz
+    read(10,*) dom%dmx
+    read(10,*) dom%dmz
 #ifdef SCALAR
     read(10,*) dom%s    
 #endif
@@ -3714,7 +3884,11 @@ module mod_momentum
   implicit none
 
   logical :: pressure_grad=.false.  ! impose(T) or expose(F) pressure gradient
-  logical :: gravity_slope=.false.     ! impose(T) or expose(F) gravity from river slope
+  logical :: smooth_PGX=.false.     ! impose(T) or expose(F) smoothing pressure gradient
+  logical :: gravity_slope=.false.  ! impose(T) or expose(F) gravity from river slope
+
+  real ::         &
+    threshold_PGX= 10.0    ! correction factor for suspended solid diffusion dcx and dcz
 
 contains
 
@@ -3723,7 +3897,7 @@ contains
     implicit none
 
     ! namelist
-    namelist /momentum/ pressure_grad, gravity_slope
+    namelist /momentum/ pressure_grad, smooth_PGX, gravity_slope, threshold_PGX
 
     ! loading from namelist file
     open(10, file='namelist.in', status='old')
@@ -3751,7 +3925,7 @@ contains
     integer, pointer, dimension(:) :: k_bot, kc_bot
     real, pointer, dimension(:) :: dx, dzs, x, z_bed
     real, pointer, dimension(:,:) :: au, aw, aus, aws, vols
-    real, pointer, dimension(:,:) :: rho, p, dmx, dmz
+    real, pointer, dimension(:,:) :: rho, p, dmx, dmz, PGX
 
     integer :: i, j, k
     real :: rhs, fp, fm, fxm, fxp, fzm, fzp, q_col_, ini_slope, dmzmax, PG
@@ -3848,13 +4022,23 @@ contains
         ! pressure gradient
         if (pressure_grad) then
           if (k == k_srf) then
-            PG = (p(i+1,k) - p(i,k))/rho_water/dom%dxs(i)*vols(i,k)
-            rhs = rhs - PG
+            dom%PGX(i,k) = (p(i+1,k) - p(i,k))/rho_water/dom%dxs(i)*vols(i,k)
+            if (smooth_PGX) then
+              if (abs(dom%PGX(i,k)) > threshold_PGX) then
+                dom%PGX(i,k) = ((p(i+1,k) - p(i-1,k))/2)/rho_water/dom%dxs(i)*vols(i,k)
+              endif
+            endif
+            rhs = rhs - dom%PGX(i,k)
           else
-            PG = ( (p(i+1,k) - p(i,k)) + (p(i+1,k+1) - p(i,k+1)) )/(rho_water*2*dom%dxs(i))*vols(i,k)
-            rhs = rhs - PG
+            dom%PGX(i,k) = ( (p(i+1,k) - p(i,k)) + (p(i+1,k+1) - p(i,k+1)) )/(rho_water*2*dom%dxs(i))*vols(i,k)
+            if (smooth_PGX) then
+              if (abs(dom%PGX(i,k)) > threshold_PGX) then
+                dom%PGX(i,k) = ( (p(i+1,k) - p(i-1,k))/2 + (p(i+1,k+1) - p(i-1,k+1))/2 )/(rho_water*2*dom%dxs(i))*vols(i,k)
+              endif
+            endif
+            rhs = rhs - dom%PGX(i,k)
           endif
-        !  print '(2i4, 3f15.5)',  i, k, p(i+1,k), p(i,k), PG
+          !print '(2i4, 3f15.5)',  i, k, p(i+1,k), p(i,k), dom%PGX(i,k)
         endif
 
         ! Gravity from river slope
@@ -3963,7 +4147,8 @@ module mod_heat
     ar=0.06,      &   ! refraction rate of solar radiation on water surface
     beta=0.5,     &   ! absorption parameter [0.4:0.6]
     eta=0.5,      &   ! decay parameter [0.3:1.5]
-    z_wind=1.0        ! measured height of wind speed, m
+    z_wind=1.0,   &   ! measured height of wind speed, m
+    alpha_heat=1.0    ! correction factor for dhx and dhz
 
   real, parameter :: &
     z0=1.e-4          ! roughness length at water surface, m
@@ -3990,7 +4175,7 @@ contains
     implicit none
 
     ! namelist (heat)
-    namelist /heat/ radiation, ar, beta, eta, z_wind, fname_meteo
+    namelist /heat/ radiation, ar, beta, eta, z_wind, alpha_heat, fname_meteo
 
     ! loading from namelist file
     open(10, file='namelist.in', status='old')
@@ -4218,13 +4403,13 @@ contains
         if (i == 1 .or. k <= k_bot(i-1)) then
           fm = 0.0
         else
-          fm = dhx(i-1,k)*(t(i,k) - t(i-1,k))/dxs(i-1)*au(i-1,k)
+          fm = alpha_heat*dhx(i-1,k)*(t(i,k) - t(i-1,k))/dxs(i-1)*au(i-1,k)
         endif
 
         if (i == nx .or. k <= k_bot(i)) then
           fp = 0.0
         else
-          fp = dhx(i,k)*(t(i+1,k) - t(i,k))/dxs(i)*au(i,k)
+          fp = alpha_heat*dhx(i,k)*(t(i+1,k) - t(i,k))/dxs(i)*au(i,k)
         endif
 
         fxm = fxm + fm
@@ -4234,13 +4419,13 @@ contains
         if (k == kc_bot(i)) then
           fm = fm + 0.0
         else
-          fm = fm + dhz(i,k-1)*(t(i,k) - t(i,k-1))/dzs(k-1)*aw(i,k-1)
+          fm = fm + alpha_heat*dhz(i,k-1)*(t(i,k) - t(i,k-1))/dzs(k-1)*aw(i,k-1)
         endif
 
         if (k == k_srf) then
           fp = fp + 0.0
         else
-          fp = fp + dhz(i,k)*(t(i,k+1) - t(i,k))/dzs(k)*aw(i,k)
+          fp = fp + alpha_heat*dhz(i,k)*(t(i,k+1) - t(i,k))/dzs(k)*aw(i,k)
         endif
 
         ! radiation heat flux
@@ -4307,6 +4492,9 @@ module mod_suspended_solids
 
   implicit none
 
+  real ::         &
+    alpha_ss=1.0    ! correction factor for suspended solid diffusion dcx and dcz
+
 contains
 
   subroutine set_suspended_solids()
@@ -4318,7 +4506,7 @@ contains
 
     ! namelist (particle)
     real :: particle_size(20)=0.0   ! particle size for each bins, m
-    namelist /particle/ nps, particle_size, rho_ss
+    namelist /particle/ nps, particle_size, rho_ss, alpha_ss
 
     integer :: l
     real :: rep
@@ -4439,13 +4627,13 @@ contains
         if (i == 1 .or. k <= k_bot(i-1)) then
           fm = 0.0
         else
-          fm = dcx(i-1,k)*(c(i,k,l) - c(i-1,k,l))/dxs(i-1)*au(i-1,k)
+          fm = alpha_ss*dcx(i-1,k)*(c(i,k,l) - c(i-1,k,l))/dxs(i-1)*au(i-1,k)
         endif
 
         if (i == nx .or. k <= k_bot(i)) then
           fp = 0.0
         else
-          fp = dcx(i,k)*(c(i+1,k,l) - c(i,k,l))/dxs(i)*au(i,k)
+          fp = alpha_ss*dcx(i,k)*(c(i+1,k,l) - c(i,k,l))/dxs(i)*au(i,k)
         endif
 
         fxm = fxm + fm
@@ -4455,13 +4643,13 @@ contains
         if (k == kc_bot(i)) then
           fm = fm + 0.0
         else
-          fm = fm + dcz(i,k-1)*(c(i,k,l) - c(i,k-1,l))/dzs(k-1)*aw(i,k-1)
+          fm = fm + alpha_ss*dcz(i,k-1)*(c(i,k,l) - c(i,k-1,l))/dzs(k-1)*aw(i,k-1)
         endif
 
         if (k == k_srf) then
           fp = fp + 0.0
         else
-          fp = fp + dcz(i,k)*(c(i,k+1,l) - c(i,k,l))/dzs(k)*aw(i,k)
+          fp = fp + alpha_ss*dcz(i,k)*(c(i,k+1,l) - c(i,k,l))/dzs(k)*aw(i,k)
         endif
 
         fzm = fzm + fm
@@ -4500,8 +4688,6 @@ contains
 
         ! new c
         dom%c(i,k,l) = c(i,k,l) + dt_sec*rhs/vol(i,k)
-        dom%c(i,k,l) = max(dom%c(i,k,l), 1.0e-20)
-
       enddo
     enddo
 
