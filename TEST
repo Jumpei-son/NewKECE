@@ -272,9 +272,6 @@ module mod_domain
     real :: dz_srf     ! depth of the surface layer, m
     real :: total_vol  ! total water volume, m3
     real :: q_total_vol! flowrate due to water surface level fluctuations, m3
-    real :: rho_s1     ! surface layer density around inflow
-    real :: rho_s2     ! surface-1 layer density around inflow
-    real :: rho_s3     ! surface-2 layer density around inflow
     integer :: log_i_inlet
 
     !-- primary variables
@@ -293,7 +290,9 @@ module mod_domain
     real, pointer, dimension(:,:) :: &
       rho,    &  ! water density, kg/m3
       GRAV,   &  ! gravity from river gradient, 
-      PGX        ! pressure gradient,
+      PGX,    &  ! pressure gradient or filterd pressure gradient in time filter
+      PGXraw, &  ! new pressure gradient in time filter, 
+      PGXold     ! old pressure gradient in time filter,
 
     real, pointer, dimension(:) :: &
       rho_avg    ! horizontary averaged water density at w-pos, kg/m3
@@ -783,7 +782,7 @@ contains
 
     allocate (dom%tke(0:nx+1,0:nz+1), dom%td_eps(0:nx+1,0:nz+1))
     allocate (dom%nut(nx,nz))
-    allocate (dom%PGX(nx,nz))
+    allocate (dom%PGX(nx,nz), dom%PGXold(nx,nz), dom%PGXraw(nx,nz))
 
     allocate (dom%exceed_logged(nx,0:nz))
     dom%exceed_logged = .false.
@@ -817,7 +816,7 @@ contains
     nullify (dom%u, dom%w, dom%t, dom%c)
 
     ! model variables
-    nullify (dom%p, dom%rho, dom%rho_avg, dom%PGX)
+    nullify (dom%p, dom%rho, dom%rho_avg, dom%PGX, dom%PGXraw, dom%PGXold)
     nullify (dom%dmx, dom%dmz, dom%dhx, dom%dhz, dom%dcx, dom%dcz)
     nullify (dom%tke, dom%td_eps, dom%nut)
     nullify (dom%c_sed)
@@ -1260,7 +1259,7 @@ contains
       ll = 0.5,    &  ! strength param of the expornent
       mm = 0.5,    &  ! strength param of the expornent
       nn = 0.5,    &  ! strength param of the expornent
-      dmix = 1e-2     ! vertical diffusivity of mixing zone, m2/s
+      dmix = 1e-3     ! vertical diffusivity of mixing zone, m2/s
     logical :: use_kepsilon = .false.   ! impose(T) or expose(F) k-epsilon 
     logical :: freeslip = .false.       ! impose(T) or expose(F) freeslip in k-epsilon 
 
@@ -1382,12 +1381,12 @@ contains
 
         u_starS = SQRT(1.25 * CZ * wind10**2 / rho(i,dom%k_srf))
 
-        ! bottom shear velocity usign simple model
+        ! bottom shear velocity using simple model
         FRIC = 100.0
         GC2 = gravity / (FRIC**2)
         u_starBS = SQRT(GC2) * ABS(0.5* (u(i, dom%k_srf) + u(i-1, dom%k_srf)))
 
-        ! setting surface tke and td_eps
+        ! set surface tke and td_eps
         depth(i) = dom%z_srf - dom%z_bed(i)
         tke(i, dom%k_srf) = ( 3.33*(u_starS**2 + u_starBS**2) )
         td_eps(i, dom%k_srf) = (u_starS**3 + u_starBS**3)*5.0 / depth(i)
@@ -1396,19 +1395,21 @@ contains
         do k = dom%kc_bot(i)+1, dom%k_srf-1
           ! shear production and buoyoncy
           buoy_k = MAX( dom%dmz(i,k)*gravity*(dom%rho(i,k-1) - dom%rho(i,k))/(rho_water*dom%dz(k)), 0.0 )
-          Prdk = dom%dmz(i,k)*( 0.5*(dom%u(i,k) + dom%u(i-1,k) - dom%u(i,k-1) - dom%u(i-1,k-1)) &
+          ! select Prdk calc 
+          Prdk = dom%dmz(i,k)*( 0.5*(dom%u(i,k) - dom%u(i,k-1) + dom%u(i-1,k)  - dom%u(i-1,k-1)) &
           / (dom%dz(k)*0.5 + dom%dz(k-1)*0.5) )**2
+          !Prdk = dom%dmz(i,k)*( (dom%u(i,k) - dom%u(i,k-1))/ (dom%dz(k)*0.5 + dom%dz(k-1)*0.5) )**2
           Prhe = 10.0* GC2**1.25 *ABS( 0.5*(dom%u(i,k) + dom%u(i-1,k)))**4.0 &
           / (0.5*dom%au(i,k)/dom%dz(k))**2
           Prhk = GC2 / (0.5*dom%au(i,k)/dom%dz(k)) * ABS(0.5 * (dom%u(i,k) + dom%u(i-1,k)))**3
 
           ! update (Production - Dissipasion)
           Unst = Prdk - dom%td_eps(i,k)
-          Unse = 1.44 * dom%td_eps(i,k)/dom%tke(i,k)*Prdk - 1.92 * (dom%td_eps(i,k)/dom%tke(i,k) * dom%td_eps(i, k))
+          Unse = 1.44 * dom%td_eps(i,k)/dom%tke(i,k)*Prdk - 1.92 * (dom%td_eps(i,k)**2/dom%tke(i,k))
 
           dom%tke(i,k) = dom%tke(i,k) + dt_sec*(Unst + Prhk - buoy_k)
           dom%td_eps(i,k) = dom%td_eps(i,k) + dt_sec*(Unse + Prhe)
-          !print '(2i5, 3f30.10)',  i, k, Prdk, buoy_k, dom%tke(i, k)
+          !print '(2i5, 8f14.10)',  i, k, buoy_k, Prdk, Prhe, Prhk, Unst, Unse, dom%tke(i, k), dom%td_eps(i,k)
         end do
 
         ! bottom tke and td_eps
@@ -1452,6 +1453,11 @@ contains
         do k = dom%kc_bot(i), dom%k_srf-1
           dom%tke(i,k) = MAX(dom%tke(i,k), 1.25D-7)
           dom%td_eps(i,k) = MAX(dom%td_eps(i,k), 1.0e-9)
+          ! WARNING forced control maximum tke due to prevent a sudden increase
+          dom%tke(i,k) = MIN(dom%tke(i,k), 10.0)
+          ! WARNING forced control maximum turbulent dissipation eps due to prevent a sudden increase
+          !dom%td_eps(i,k) = MIN(dom%td_eps(i,k), 1.0)
+
           dom%nut(i,k) = 0.09*dom%tke(i,k)**2/td_eps(i,k)
         !print '(2i5, 3f30.10)',  i, k, dom%nut(i,k), dom%td_eps(i, k), dom%tke(i, k)
         enddo
@@ -1484,7 +1490,7 @@ contains
 
         dom%dmz(i,dom%k_srf) = dom%dmz(i,dom%k_srf-1)
         dom%dhz(i,dom%k_srf) = dom%dhz(i,dom%k_srf-1)
-        dom%dcz(i,dom%k_srf) = dom%dhz(i,dom%k_srf-1)
+        dom%dcz(i,dom%k_srf) = dom%dcz(i,dom%k_srf-1)
       enddo
 
       if (dom%freeslip) then
@@ -2257,15 +2263,30 @@ contains
 
     integer :: nx, nz, k_srf
     real :: z_srf
+    integer, pointer :: kc_bot(:)
     real, pointer :: z(:), zc(:), dz(:), rho_(:)
+    real, pointer, dimension(:,:) :: rho
 
-    integer :: i, j, k, l, kc, kb
-    real :: tmp, eps, delta, zeta, q_, z_out
+    integer :: i, j, k, l, kc, kb, kc_up, kc_dw, kc_thick, KTOP, KBOT
+    real :: tmp, eps, delta, zeta, q_, z_out, lev_outtop, lev_outbot
+    real :: HT, HB, OUTCOEF, RHOFT, HSWT, RHOFB, HSWB, delta_top, delta_bot, DLRHOT, DLRHOB, DLRHOMAX, VSUM
     real, allocatable :: array(:), f(:), c_(:), u(:), q(:)
 
+    character(3) :: outflowtype
+    real ::         &
+      out_height= 3.0        ! outlet gate height
+
+    ! namelist
+    namelist /outflow/ outflowtype, out_height
+
+    ! loading from namelist file
+    open(10, file='namelist.in', status='old')
+    read(10, nml=outflow)
+    close(10)
+
     !--- pointer and allocate arrays ---------------
-    nx=dom%nx; nz=dom%nz; k_srf=dom%k_srf; z_srf=dom%z_srf
-    z=>dom%z; zc=>dom%zc; dz=>dom%dz; rho_=>dom%rho_avg
+    nx=dom%nx; nz=dom%nz; k_srf=dom%k_srf; z_srf=dom%z_srf; kc_bot=>dom%kc_bot
+    z=>dom%z; zc=>dom%zc; dz=>dom%dz; rho_=>dom%rho_avg; rho=>dom%rho
     allocate (f(dom%nz), c_(nps), u(dom%nz), q(dom%nz))
     !-----------------------------------------------
 
@@ -2285,6 +2306,10 @@ contains
       ! outlet variables
       dom%u(nx,:)=0.0
 
+
+    SELECT CASE (outflowtype)
+
+    CASE ('NDO')        ! normal distributed outflow
       do j=1, dom%n_out
 
         kc = -1
@@ -2339,12 +2364,6 @@ contains
             f(k) = exp(-0.5*(zeta*3.92)**2)
         enddo
 
-
-        ! no vertical distribution of outflow
-        !f(:) = 0.0
-        !f(kc) = 1.0
-
-
         ! outlet velocity, temperature and suspended solids
         tmp = sum(dom%au(nx,kb:k_srf)*f(kb:k_srf))
         f(kb:k_srf) = f(kb:k_srf)/tmp
@@ -2360,7 +2379,278 @@ contains
         dom%s_outs(j) = sum(q(kb:k_srf)*dom%s(nx,kb:k_srf))/q_
 #endif
 
-      enddo
+      enddo             ! End outflow number j normal distributed in outflow height
+
+    CASE ('EDO')        ! equal distributed in outflow height
+      do j=1, dom%n_out
+
+        kc = -1
+
+        if (dom%surf_outs(j)) then ! surface outflow
+
+          z_out = z_srf
+          kc = k_srf
+
+        else                     ! in-water outflow
+
+          z_out = dom%z_outs(j)
+
+          ! find kc
+          if (dom%z_outs(j) >= z(k_srf-1)) then
+            z_out = z_srf
+            kc = k_srf
+          else if (z(kb) >= dom%z_outs(j)) then
+            z_out = z(kb)
+            kc = kb
+          else
+            do k=k_srf-1, kb+1, -1
+              if (z(k-1) <= dom%z_outs(j) .and. dom%z_outs(j) <= z(k)) then
+                z_out = dom%z_outs(j)
+                kc = k
+                exit
+              endif
+            enddo
+          endif
+
+        endif
+
+        if (kc < 0) then
+          print *, 'error: cant find kc, in subroutine update_outflow'
+          stop
+        endif
+
+        ! check distribution thickness
+        lev_outtop = z_out + out_height*0.5
+        lev_outbot = z_out - out_height*0.5
+
+        do k=k_srf-1, kb+1, -1
+          if (z(k-1) <= lev_outtop .and. lev_outtop <= z(k)) then
+            kc_up = k
+            exit
+          endif
+        enddo
+
+        do k=k_srf-1, kb+1, -1
+          if (z(k-1) <= lev_outbot .and. lev_outbot <= z(k)) then
+            kc_dw = k
+            exit
+          endif
+        enddo
+
+        kc_thick = MAX((kc_up - kc_dw), 1)
+
+        do l= 1, int(out_height)
+          if (kc_up > k_srf) then
+            kc_up = kc_up - 1
+            kc_thick = kc_thick - 1
+          endif
+        enddo
+
+        do l= 1, int(out_height)
+          if (kc_dw < kc_bot(nx)) then
+            kc_dw = kc_dw - 1
+            kc_thick = kc_thick - 1
+          endif
+        enddo
+
+        kc_thick = MAX(kc_thick, 1)  
+
+        ! outlet velocity, temperature and suspended solids
+        ! equal distribution
+        u(:) = 0.0
+        if(kc_thick > 1) then
+          do k= kc_dw, kc_up
+            u(k) = dom%q_outs(j)/dom%au(nx,k)/kc_thick
+          enddo
+        else
+          u(kc) = dom%q_outs(j)/dom%au(nx,kc)
+        endif
+
+        !print '(3i4, 4f15.5)',  kc_dw, kc_up, kc_thick, dom%q_outs(j), dom%au(nx,k), u(kc_dw), u(kc)
+
+        q(kb:k_srf) = u(kb:k_srf)*dom%au(nx,kb:k_srf)
+        dom%u(nx,kb:k_srf) = dom%u(nx,kb:k_srf) + u(kb:k_srf)
+        q_ = dom%q_outs(j) + 1.e-8
+        dom%t_outs(j) = sum(q(kb:k_srf)*dom%t(nx,kb:k_srf))/q_
+        do i=1, nps
+          dom%c_outs(j,i) = sum(q(kb:k_srf)*dom%c(nx,kb:k_srf,i))/q_
+        enddo
+#ifdef SCALAR
+        dom%s_outs(j) = sum(q(kb:k_srf)*dom%s(nx,kb:k_srf))/q_
+#endif
+
+      enddo             ! End outflow number j loop equal distributed in outflow height
+
+    CASE ('DDD')        ! Density denpended distributed outflow
+      do j=1, dom%n_out
+
+        kc = -1
+
+        if (dom%surf_outs(j)) then ! surface outflow
+
+          z_out = z_srf
+          kc = k_srf
+
+        else                     ! in-water outflow
+
+          z_out = dom%z_outs(j)
+
+          ! find kc
+          if (dom%z_outs(j) >= z(k_srf-1)) then
+            z_out = z_srf
+            kc = k_srf
+          else if (z(kb) >= dom%z_outs(j)) then
+            z_out = z(kb)
+            kc = kb
+          else
+            do k=k_srf-1, kb+1, -1
+              if (z(k-1) <= dom%z_outs(j) .and. dom%z_outs(j) <= z(k)) then
+                z_out = dom%z_outs(j)
+                kc = k
+                exit
+              endif
+            enddo
+          endif
+
+        endif
+
+        if (kc < 0) then
+          print *, 'error: cant find kc, in subroutine update_outflow'
+          stop
+        endif
+
+        ! density based velocity profile
+        f(:) = 0.0
+        HSWT = 0.0
+        HSWB = 0.0
+
+        KTOP = k_srf
+        KBOT = kc_bot(nx)
+        ! user diffinition mode
+        !KTOP = MAX(KTSW(j), KT)
+        !KBOT = MAX(KBSW(j), KT)
+
+        ! coefficient for outflow thickness near the water surface or bottom
+        OUTCOEF = 1.0 
+        if ((z_out/z_srf) > 0.9) then
+          OUTCOEF = 2.0
+        endif
+
+        ! outflow zone above structure
+        do k= kc+1, k_srf
+          ! Density frequency
+          HT = z(k) - z_out
+          RHOFT = MAX(SQRT((ABS(rho(nx,k) - rho(nx,kc)))/(HT*rho(nx,kc) + 1.0E-10)*gravity), 1.0E-10)
+
+          ! Thickness of point sink flow
+          HSWT = (OUTCOEF*dom%q_outs(j)/RHOFT)**0.333333
+          ! Thickness of distributed sink flow
+          !HSWT = SQRT(2.0*OUTCOEF*dom%q_outs(j)/(out_height*RHOFT))
+
+          if (HT >= HSWT) then
+            KTOP = k; exit
+          end if
+        
+          !print '(3i4, 7f10.5)', k_srf, kc_bot(nx), KTOP, OUTCOEF, HT, RHOFT, rho(nx,k), rho(nx,kc), HSWT
+
+        enddo
+
+        ! Reference density of above structure
+        if ((z_out + HSWT) < z_srf) THEN
+          DLRHOT = ABS(rho(nx,kc) - rho(nx, KTOP))
+        else if (z_srf == z_out) THEN
+          DLRHOT = 1.0e-10
+        else
+          DLRHOT = ABS(rho(nx,kc) - RHO(nx,k_srf))*HSWT/(z_srf-z_out)
+        endif
+        DLRHOT = MAX(DLRHOT, 1.0e-10)
+
+        !print '(3i4, 7f10.5)', k_srf, kc_bot(nx), KTOP, OUTCOEF, HT, RHOFT, rho(nx,k), rho(nx,kc), HSWT, DLRHOT
+
+        ! outflow zone below structure
+        do k= kc-1, kc_bot(nx), -1
+          ! Density frequency
+          HB = z_out - z(k)
+          RHOFB = MAX(SQRT((ABS(rho(nx,k) - rho(nx,kc)))/(HB*rho(nx,kc) + 1.0E-10)*gravity), 1.0E-10)
+
+          ! Thickness of point sink flow
+          HSWB = (OUTCOEF*dom%q_outs(j)/RHOFB)**0.333333
+          ! Thickness of distributed sink flow
+          !HSWB = SQRT(2.0*OUTCOEF*dom%q_outs(j)/(out_height*RHOFB))
+
+          if (HB >= HSWB) then
+            KBOT = k; exit
+          end if
+          
+          !print '(3i4, 7f10.5)', k, kc_bot(nx), KBOT, OUTCOEF, HB, RHOFB, rho(nx,k), rho(nx,kc), HSWB
+        enddo
+
+        ! Reference density of below structure
+        if ((z_out + HSWT) < z_srf) THEN
+          DLRHOB = ABS(rho(nx,kc) - rho(nx, KBOT))
+        else if (z(KBOT+1) == z_out) THEN
+          DLRHOB = 1.0e-10
+        else
+          DLRHOB = ABS(rho(nx,kc) - rho(nx,KBOT))*HSWB/(z_out - z(kc_bot(nx)))
+        endif
+        DLRHOB = MAX(DLRHOB, 1.0e-10)
+
+        !print '(3i4, 7f10.5)', k, kc_bot(nx), KBOT, OUTCOEF, HB, RHOFB, rho(nx,k), rho(nx,kc), HSWB, DLRHOB
+
+        ! Velocity profile 
+        VSUM = 0.0
+        do k=KBOT, KTOP
+          if(k < kc) then
+            DLRHOMAX = MAX(DLRHOB, 1.0e-10)
+          else
+            DLRHOMAX = MAX(DLRHOT, 1.0e-10)   
+          endif
+
+          f(k) = 1.0 - ((rho(nx,kc) - rho(nx,k))/DLRHOMAX)**2
+          IF(f(k).GT.1.0) f(k)=1.0  
+          IF(f(k).LT.0.0) f(k)=0.0
+          !print '(3i4, 7f10.5)', k, KBOT, KTOP, DLRHOMAX, f(k)
+
+          f(k) = f(k)*dom%au(nx,k)
+          VSUM = VSUM + f(k)
+        end do
+
+        ! suggested codex 
+        !tmp = maxval(abs(rho_(kc:k_srf) - rho_(kc)))
+        !delta_top = max(tmp, 1.e-10)
+        !tmp = maxval(abs(rho_(kb:kc) - rho_(kc)))
+        !delta_bot = max(tmp, 1.e-10)
+        !do k=kb, k_srf
+        !  if (k > kc) then
+        !    dlrhomax = delta_bot
+        !  else
+        !    dlrhomax = delta_top
+        !  endif
+        !  tmp = 1.0 - ((rho_(k) - rho_(kc))/dlrhomax)**2
+        !  tmp = max(0.0, min(1.0, tmp))
+        !  f(k) = tmp*dom%au(nx,k)
+        !enddo
+        !delta = sum(f(kb:k_srf))
+        !if (delta <= 0.0) delta = 1.e-12
+        !f(kb:k_srf) = f(kb:k_srf)/delta
+
+        ! outlet velocity, temperature and suspended solids
+        !u(kb:k_srf) = dom%q_outs(j)*f(kb:k_srf)/dom%au(nx,kb:k_srf)
+        u(kb:k_srf) = dom%q_outs(j)*f(kb:k_srf)/VSUM/dom%au(nx,kb:k_srf)
+        q(kb:k_srf) = dom%q_outs(j)*f(kb:k_srf)
+        dom%u(nx,kb:k_srf) = dom%u(nx,kb:k_srf) + u(kb:k_srf)
+        q_ = dom%q_outs(j) + 1.e-8
+        dom%t_outs(j) = sum(q(kb:k_srf)*dom%t(nx,kb:k_srf))/q_
+        do i=1, nps
+          dom%c_outs(j,i) = sum(q(kb:k_srf)*dom%c(nx,kb:k_srf,i))/q_
+        enddo
+#ifdef SCALAR
+        dom%s_outs(j) = sum(q(kb:k_srf)*dom%s(nx,kb:k_srf))/q_
+#endif
+
+      enddo            ! End DO loop Density denpended distributed outflow
+
+    END SELECT
 
     else if (dom%n_out == 0) then  ! open boundary
 
@@ -2393,6 +2683,7 @@ contains
     else
       dom%qtot_out = sum(dom%q_outs)
     endif
+
 
     !--- de-allocate arrays ---
     deallocate (f, c_, u, q)
@@ -3888,7 +4179,8 @@ module mod_momentum
   logical :: gravity_slope=.false.  ! impose(T) or expose(F) gravity from river slope
 
   real ::         &
-    threshold_PGX= 10.0    ! correction factor for suspended solid diffusion dcx and dcz
+    threshold_PGX= 10.0,   &   ! correction factor for suspended solid diffusion dcx and dcz
+    beta_PGX= 0.50             ! time filter coefficient 0-1 (0: no filter, 1: almost old)
 
 contains
 
@@ -3897,7 +4189,7 @@ contains
     implicit none
 
     ! namelist
-    namelist /momentum/ pressure_grad, smooth_PGX, gravity_slope, threshold_PGX
+    namelist /momentum/ pressure_grad, smooth_PGX, gravity_slope, threshold_PGX, beta_PGX
 
     ! loading from namelist file
     open(10, file='namelist.in', status='old')
@@ -3925,7 +4217,7 @@ contains
     integer, pointer, dimension(:) :: k_bot, kc_bot
     real, pointer, dimension(:) :: dx, dzs, x, z_bed
     real, pointer, dimension(:,:) :: au, aw, aus, aws, vols
-    real, pointer, dimension(:,:) :: rho, p, dmx, dmz, PGX
+    real, pointer, dimension(:,:) :: rho, p, dmx, dmz, PGX, PGXraw, PGXold
 
     integer :: i, j, k
     real :: rhs, fp, fm, fxm, fxp, fzm, fzp, q_col_, ini_slope, dmzmax, PG
@@ -4025,7 +4317,10 @@ contains
             dom%PGX(i,k) = (p(i+1,k) - p(i,k))/rho_water/dom%dxs(i)*vols(i,k)
             if (smooth_PGX) then
               if (abs(dom%PGX(i,k)) > threshold_PGX) then
-                dom%PGX(i,k) = ((p(i+1,k) - p(i-1,k))/2)/rho_water/dom%dxs(i)*vols(i,k)
+                if (i > 1 .and. k > k_bot(i-1)) then
+                  dom%PGXraw(i,k) = ((p(i+1,k) - p(i-1,k))/2)/rho_water/dom%dxs(i)*vols(i,k)
+                  dom%PGX(i,k) = beta_PGX*dom%PGXold(i,k) + (1.0 - beta_PGX)*dom%PGXraw(i,k)
+                endif
               endif
             endif
             rhs = rhs - dom%PGX(i,k)
@@ -4033,11 +4328,15 @@ contains
             dom%PGX(i,k) = ( (p(i+1,k) - p(i,k)) + (p(i+1,k+1) - p(i,k+1)) )/(rho_water*2*dom%dxs(i))*vols(i,k)
             if (smooth_PGX) then
               if (abs(dom%PGX(i,k)) > threshold_PGX) then
-                dom%PGX(i,k) = ( (p(i+1,k) - p(i-1,k))/2 + (p(i+1,k+1) - p(i-1,k+1))/2 )/(rho_water*2*dom%dxs(i))*vols(i,k)
+                if (i > 1 .and. k > k_bot(i-1) .and. k+1 > k_bot(i-1)) then
+                  dom%PGXraw(i,k) = ( (p(i+1,k) - p(i-1,k))/2 + (p(i+1,k+1) - p(i-1,k+1))/2 )/(rho_water*2*dom%dxs(i))*vols(i,k)
+                  dom%PGX(i,k) = beta_PGX*dom%PGXold(i,k) + (1.0 - beta_PGX)*dom%PGXraw(i,k)
+                endif
               endif
             endif
             rhs = rhs - dom%PGX(i,k)
           endif
+          dom%PGXold(i,k) = dom%PGX(i,k)
           !print '(2i4, 3f15.5)',  i, k, p(i+1,k), p(i,k), dom%PGX(i,k)
         endif
 
@@ -5000,9 +5299,9 @@ program main
 
   ! std log
   write(6,'(a)')
-  write(6,'(a)',advance='no') 'days, dom1:z_srf z_in del_in maxT maxC rho_in rho_s1 rho_s2 rho_s3 i_inlet k_srf'
+  write(6,'(a)',advance='no') 'days, dom1:z_srf z_in del_in maxT maxC rho_in i_inlet k_srf'
   if (ndom > 1) then
-    write(6,'(a)') ', dom2:z_srf z_in del_in maxT maxC rho_in rho_s1 rho_s2 rho_s3 i_inlet k_srf'
+    write(6,'(a)') ', dom2:z_srf z_in del_in maxT maxC rho_in i_inlet k_srf'
   else
     write(6,*) ''
   endif
@@ -5010,7 +5309,7 @@ program main
   write(6,'(f6.1,a,5f6.1,4f7.1,2i4)', advance='no') time_day, ', ', &
     doms(1)%z_srf, doms(1)%z_in, doms(1)%delta_in*2, &
     maxval(doms(1)%t), maxval(sum(doms(1)%c,dim=3)), &
-    doms(1)%rho_in, doms(1)%rho_s1, doms(1)%rho_s2, doms(1)%rho_s3, doms(1)%log_i_inlet, doms(1)%k_srf
+    doms(1)%rho_in, doms(1)%log_i_inlet, doms(1)%k_srf
   if (ndom > 1) then
     write(6,'(a,5f5.1)') ', ', &
       doms(2)%z_srf, doms(2)%z_in, doms(2)%delta_in*2, &
@@ -5069,7 +5368,7 @@ program main
       write(6,'(f6.1,a,5f6.1,4f7.1,2i4)', advance='no') time_day, ', ', &
         doms(1)%z_srf, doms(1)%z_in, doms(1)%delta_in*2, &
         maxval(doms(1)%t), maxval(sum(doms(1)%c,dim=3)), &
-        doms(1)%rho_in, doms(1)%rho_s1, doms(1)%rho_s2, doms(1)%rho_s3, doms(1)%log_i_inlet, doms(1)%k_srf
+        doms(1)%rho_in, doms(1)%log_i_inlet, doms(1)%k_srf
       if (ndom > 1) then
         write(6,'(a,5f5.1)') ', ', &
           doms(2)%z_srf, doms(2)%z_in, doms(2)%delta_in*2, &
