@@ -297,6 +297,7 @@ module mod_domain
     real, pointer, dimension(:) :: &
       rho_avg    ! horizontary averaged water density at w-pos, kg/m3
 
+
     real, pointer, dimension(:,:) :: &
       c_sed      ! sedimentation rate of suspended solids, g/s
 
@@ -326,6 +327,7 @@ module mod_domain
       td_eps,  & ! turbulence dissipation rate
       nut        ! eddy viscosity from k-epsilon, m2/s
     logical :: use_kepsilon = .false.
+    logical :: semi_implicit = .false.
     logical :: freeslip = .false.
 
     !-- boundary conditions
@@ -366,7 +368,10 @@ module mod_domain
       c_outs(:,:),   &    ! outlet SS concentration, kg/m3
       z_outs(:),     &    ! median level of outlet flow, m
       fr_outs(:),    &    ! internal Froude number of outflow
-      phi_outs(:)         ! outflow width, m
+      phi_outs(:),   &    ! outflow width, m
+      out_heights(:), &    ! USE ONLY "DDD" and "EDO", outflow gate height, m
+      zKTSWs(:),       &    ! USE ONLY "DDD", KTOP limitation level, m
+      zKBSWs(:)             ! USE ONLY "DDD", KBOT limitation level, m
     type(timeseries), pointer :: &
       ts_out              ! time series of outlets
     real, pointer :: &
@@ -1261,10 +1266,11 @@ contains
       nn = 0.5,    &  ! strength param of the expornent
       dmix = 1e-3     ! vertical diffusivity of mixing zone, m2/s
     logical :: use_kepsilon = .false.   ! impose(T) or expose(F) k-epsilon 
+    logical :: semi_implicit= .false.   ! impose(T) or expose(F) semi_implicit method (TRIDIAG) 
     logical :: freeslip = .false.       ! impose(T) or expose(F) freeslip in k-epsilon 
 
     namelist /turbulence/ dmx0, dmz0, dhx0, dhz0, dcx0, dcz0, &
-      ll, mm, nn, dmix, use_kepsilon, freeslip
+      ll, mm, nn, dmix, use_kepsilon, semi_implicit, freeslip
 
     ! loading from namelist file
     open(10, file=trim(dom%fname_nml), status='old')
@@ -1280,6 +1286,7 @@ contains
     dom%ll=ll; dom%mm=mm; dom%nn=nn 
     dom%dmix=dmix
     dom%use_kepsilon=use_kepsilon
+    dom%semi_implicit=semi_implicit
     dom%freeslip=freeslip
 
   end subroutine set_turbulence
@@ -1298,16 +1305,16 @@ contains
     type(domain), intent(inout) :: dom
     real, intent(in) :: dt_sec
 
-    integer :: i, k, nx, nz, k_srf
+    integer :: i, k, nx, nz, k_srf, kk, nlay
     integer, pointer, dimension(:) :: k_bot, kc_bot
-    real, pointer, dimension(:) :: dx, dz, dxs, dzs, x, z_bed
+    real, pointer, dimension(:) :: dx, dz, dxs, dzs, x, z_bed, a, b, c, d, cp, dp, sol
     real, pointer, dimension(:,:) :: au, aw, aus, aws, vols
     real, pointer, dimension(:,:) :: rho, p, dmx, dmz, tke, td_eps
     real :: ri_, u1_, u2_, uz_, rhoz_, rho_, &
       t_, nu_, nut_, alpha_, alphat_, beta_, betat_
     ! k-e variables
     real :: Prdk, Prhe, Prhk, Unst, Unse
-    real :: buoy_k, buoy_e, flux_up_tke, flux_down_tke, diff_tke, flux_up_e, flux_down_e, diff_e
+    real :: buoy_k, buoy_e, flux_up_tke, flux_down_tke, diff_tke, flux_up_e, flux_down_e, diff_e, dz_up, dz_down
     real :: u_starS, u_starBS, u_starB, kappa=0.41, z0b=1.0e-4, WIND10, CZ, GC2, FRIC
 
     real, allocatable :: u(:,:), w(:,:)
@@ -1422,31 +1429,120 @@ contains
 
       enddo
 
-      ! update vertical diffusion
-      do i = 1, nx
-        do k = dom%kc_bot(i), dom%k_srf-1
-          flux_up_tke = dom%dmz(i,k) * (dom%tke(i,k+1) - dom%tke(i,k))/( 0.5*(dom%dz(k+1)+dom%dz(k)) )
-          flux_down_tke = dom%dmz(i,k-1) * (dom%tke(i,k) - dom%tke(i,k-1))/( 0.5*(dom%dz(k)+dom%dz(k-1)) )
-          flux_up_e = dom%dmz(i,k) * (dom%td_eps(i,k+1) - dom%td_eps(i,k))/( 0.5*(dom%dz(k+1)+dom%dz(k)) )
-          flux_down_e = dom%dmz(i,k-1) * (dom%td_eps(i,k) - dom%td_eps(i,k-1))/( 0.5*(dom%dz(k)+dom%dz(k-1)) )
-          diff_tke = (flux_up_tke - flux_down_tke) / dom%aw(i,k)
-          diff_e = (flux_up_e - flux_down_e) / dom%aw(i,k)
+      ! semi implicit method using TRIDIAG calc TKE and epsilon
+      if (dom%semi_implicit) then
+        do i = 1, nx
+          nlay = k_srf - dom%kc_bot(i) + 1
 
-          dom%tke(i,k) = dom%tke(i,k) + dt_sec*diff_tke
-          dom%td_eps(i,k) = dom%td_eps(i,k) + dt_sec*diff_e
+          allocate(a(nlay), b(nlay), c(nlay), d(nlay), sol(nlay), cp(nlay), dp(nlay))
 
-          ! avoid NaNs and non-positive values
-          if (dom%tke(i,k) /= dom%tke(i,k) .or. dom%tke(i,k) <= 0.0) then
-            dom%tke(i,k) = 1.25e-7
-          end if
-          if (dom%td_eps(i,k) /= dom%td_eps(i,k) .or. dom%td_eps(i,k) <= 0.0) then
-            dom%td_eps(i,k) = 1.0e-9
-          end if
+          ! for update tke 
+          do kk = 1, nlay
+            k = dom%kc_bot(i) + kk - 1
+            dz_up = 0.5d0 * (dom%dz(k+1) + dom%dz(k))
+            dz_down = 0.5d0 * (dom%dz(k) + dom%dz(k-1))
 
-        !print '(2i5, 3f30.10)',  i, k, dom%nut(i,k), dom%td_eps(i, k), dom%tke(i, k)
+            if (kk > 1) then
+              a(kk) = -dt_sec * dom%dmz(i,k-1) / (dz_down * dom%aw(i,k))
+            else
+              a(kk) = 0.0d0
+            end if
 
+            if (kk < nlay) then
+              c(kk) = -dt_sec * dom%dmz(i,k) / (dz_up * dom%aw(i,k))
+            else
+              c(kk) = 0.0d0
+            end if
+
+            b(kk) = 1.0d0 - a(kk) - c(kk)
+            d(kk) = dom%tke(i,k)
+          end do
+
+          ! TRIDIAG method 
+          cp(1) = c(1) / b(1)
+          dp(1) = d(1) / b(1)
+          do kk = 2, nlay
+            cp(kk) = c(kk) / (b(kk) - a(kk)*cp(kk-1))
+            dp(kk) = (d(kk) - a(kk)*dp(kk-1)) / (b(kk) - a(kk)*cp(kk-1))
+          end do
+          sol(nlay) = dp(nlay)
+          do kk = nlay-1, 1, -1
+            sol(kk) = dp(kk) - cp(kk)*sol(kk+1)
+          end do
+          do kk = 1, nlay
+            k = dom%kc_bot(i) + kk - 1
+            dom%tke(i,k) = max(sol(kk), 1.25d-7)
+          end do
+
+          ! for update td_eps
+          do kk = 1, nlay
+            k = dom%kc_bot(i) + kk - 1
+            dz_up = 0.5d0 * (dom%dz(k+1) + dom%dz(k))
+            dz_down = 0.5d0 * (dom%dz(k) + dom%dz(k-1))
+
+            if (kk > 1) then
+              a(kk) = -dt_sec * dom%dmz(i,k-1) / (dz_down * dom%aw(i,k))
+            else
+              a(kk) = 0.0d0
+            end if
+
+            if (kk < nlay) then
+              c(kk) = -dt_sec * dom%dmz(i,k) / (dz_up * dom%aw(i,k))
+            else
+              c(kk) = 0.0d0
+            end if
+
+            b(kk) = 1.0d0 - a(kk) - c(kk)
+            d(kk) = dom%td_eps(i,k)
+          end do
+
+          ! TRIDIAG method 
+          cp(1) = c(1) / b(1)
+          dp(1) = d(1) / b(1)
+          do kk = 2, nlay
+            cp(kk) = c(kk) / (b(kk) - a(kk)*cp(kk-1))
+            dp(kk) = (d(kk) - a(kk)*dp(kk-1)) / (b(kk) - a(kk)*cp(kk-1))
+          end do
+          sol(nlay) = dp(nlay)
+          do kk = nlay-1, 1, -1
+            sol(kk) = dp(kk) - cp(kk)*sol(kk+1)
+          end do
+          do kk = 1, nlay
+            k = dom%kc_bot(i) + kk - 1
+            dom%td_eps(i,k) = max(sol(kk), 1.0d-9)
+          end do
+
+          deallocate(a, b, c, d, sol, cp, dp)
+        end do
+
+      else    ! upwind method calc TKE and epsilon
+        ! update vertical diffusion
+        do i = 1, nx
+          do k = dom%kc_bot(i), dom%k_srf-1
+            flux_up_tke = dom%dmz(i,k) * (dom%tke(i,k+1) - dom%tke(i,k))/( 0.5*(dom%dz(k+1)+dom%dz(k)) )
+            flux_down_tke = dom%dmz(i,k-1) * (dom%tke(i,k) - dom%tke(i,k-1))/( 0.5*(dom%dz(k)+dom%dz(k-1)) )
+            flux_up_e = dom%dmz(i,k) * (dom%td_eps(i,k+1) - dom%td_eps(i,k))/( 0.5*(dom%dz(k+1)+dom%dz(k)) )
+            flux_down_e = dom%dmz(i,k-1) * (dom%td_eps(i,k) - dom%td_eps(i,k-1))/( 0.5*(dom%dz(k)+dom%dz(k-1)) )
+            diff_tke = (flux_up_tke - flux_down_tke) / dom%aw(i,k)
+            diff_e = (flux_up_e - flux_down_e) / dom%aw(i,k)
+
+            dom%tke(i,k) = dom%tke(i,k) + dt_sec*diff_tke
+            dom%td_eps(i,k) = dom%td_eps(i,k) + dt_sec*diff_e
+
+            ! avoid NaNs and non-positive values
+            if (dom%tke(i,k) /= dom%tke(i,k) .or. dom%tke(i,k) <= 0.0) then
+              dom%tke(i,k) = 1.25e-7
+            end if
+            if (dom%td_eps(i,k) /= dom%td_eps(i,k) .or. dom%td_eps(i,k) <= 0.0) then
+              dom%td_eps(i,k) = 1.0e-9
+            end if
+
+          !print '(2i5, 3f30.10)',  i, k, dom%nut(i,k), dom%td_eps(i, k), dom%tke(i, k)
+
+          enddo
         enddo
-      enddo
+
+      end if
 
       ! update eddy viscousity coefficient
       do i = 1, nx
@@ -1658,7 +1754,7 @@ contains
 
     integer :: n_out
     logical, dimension(10) :: surf_out
-    real, dimension(10) :: z_out, fr_out, phi_out
+    real, dimension(10) :: z_out, fr_out, phi_out, out_height, zKTSW, zKBSW
     character(len=128) :: fname_out
 
     integer :: n_trb
@@ -1690,7 +1786,7 @@ contains
 
     namelist /boundary/ &
       id_up, fr_in, b_in, z_in_low, fname_in, &
-      n_out, surf_out, z_out, fr_out, phi_out, fname_out, &
+      n_out, surf_out, z_out, fr_out, phi_out, fname_out, out_height, zKTSW, zKBSW,&
       n_trb, x_trb, fr_trb, b_trb, theta_trb, z_trb_low, fname_trb, &
       n_cnf, id_cnf, x_cnf, theta_cnf, &
       n_wtp, id_wtp, x_wtp, z_wtp, fr_wtp, phi_wtp, theta_wtp, fname_wtp, &
@@ -1701,6 +1797,7 @@ contains
     ! default parameters
     id_up=0; fr_in=0.25; b_in=100.; z_in_low=-999.; fname_in=''
     n_out=1; surf_out=.false.; z_out=-999.; fr_out=0.134; phi_out=90.; fname_out=''
+    out_height= 4.0; zKTSW= 999.0; zKBSW=-999.0
     n_trb=0; x_trb=-999.; fr_trb=0.25; b_trb=100.; theta_trb=90.; z_trb_low=-999.
     fname_trb=''
     n_cnf=0; id_cnf=0; x_cnf=-999.; theta_cnf=90.
@@ -1767,6 +1864,7 @@ contains
     !
     allocate ( &
       dom%surf_outs(n_out), dom%z_outs(n_out), dom%fr_outs(n_out), dom%phi_outs(n_out), &
+      dom%out_heights(n_out), dom%zKTSWs(n_out), dom%zKBSWs(n_out), &
       dom%ts_out, dom%q_outs(n_out), dom%t_outs(n_out), dom%c_outs(n_out,nps), &
       dom%t_out, dom%c_out(nps))
 #ifdef SCALAR
@@ -1780,6 +1878,7 @@ contains
     dom%n_out=n_out; dom%surf_outs=surf_out(1:n_out)
     dom%z_outs=z_out(1:n_out); dom%fr_outs=fr_out(1:n_out)
     dom%phi_outs=phi_out(1:n_out)
+    dom%out_heights=out_height(1:n_out); dom%zKTSWs=zKTSW(1:n_out); dom%zKBSWs=zKBSW(1:n_out)
 
     !-- tributary
     !
@@ -2254,7 +2353,7 @@ contains
     ! inputs:  ts_out, time_day, rho_avg
     ! outputs: q_outs, u, t_out, c_out
     !
-    use mod_parameter, only : pi, gravity, nps, rho_water
+    use mod_parameter, only : pi, gravity, nps, rho_water, turbid_density
 
     implicit none
 
@@ -2266,18 +2365,18 @@ contains
     integer, pointer :: kc_bot(:)
     real, pointer :: z(:), zc(:), dz(:), rho_(:)
     real, pointer, dimension(:,:) :: rho
-
-    integer :: i, j, k, l, kc, kb, kc_up, kc_dw, kc_thick, KTOP, KBOT
-    real :: tmp, eps, delta, zeta, q_, z_out, lev_outtop, lev_outbot
+    integer :: i, j, k, l, kc, kb, kc_up, kc_dw, kc_thick, KTOP, KBOT, SETT, SETB
+    real :: tmp, eps, delta, zeta, q_, z_out, lev_outtop, lev_outbot, zKTSW, zKBSW
     real :: HT, HB, OUTCOEF, RHOFT, HSWT, RHOFB, HSWB, delta_top, delta_bot, DLRHOT, DLRHOB, DLRHOMAX, VSUM
-    real, allocatable :: array(:), f(:), c_(:), u(:), q(:)
+    real, allocatable :: array(:), f(:), c_(:), u(:), q(:), rho_outavg(:), volay(:)
 
     character(3) :: outflowtype
+    logical :: ktswkbsw = .false.   ! impose(T) or expose(F) KTSW and KBSW to calc KTOP and KBOT 
     real ::         &
       out_height= 3.0        ! outlet gate height
 
     ! namelist
-    namelist /outflow/ outflowtype, out_height
+    namelist /outflow/ outflowtype, ktswkbsw, out_height
 
     ! loading from namelist file
     open(10, file='namelist.in', status='old')
@@ -2287,7 +2386,7 @@ contains
     !--- pointer and allocate arrays ---------------
     nx=dom%nx; nz=dom%nz; k_srf=dom%k_srf; z_srf=dom%z_srf; kc_bot=>dom%kc_bot
     z=>dom%z; zc=>dom%zc; dz=>dom%dz; rho_=>dom%rho_avg; rho=>dom%rho
-    allocate (f(dom%nz), c_(nps), u(dom%nz), q(dom%nz))
+    allocate (f(dom%nz), c_(nps), u(dom%nz), q(dom%nz), rho_outavg(dom%nz), volay(dom%nz))
     !-----------------------------------------------
 
     ! bottom k at outlet
@@ -2383,7 +2482,6 @@ contains
 
     CASE ('EDO')        ! equal distributed in outflow height
       do j=1, dom%n_out
-
         kc = -1
 
         if (dom%surf_outs(j)) then ! surface outflow
@@ -2482,6 +2580,26 @@ contains
       enddo             ! End outflow number j loop equal distributed in outflow height
 
     CASE ('DDD')        ! Density denpended distributed outflow
+      ! average density include SS in front of dam
+      volay(:) = 1.0e-10
+      rho_outavg(:) = 0.0
+
+      do k = 1, k_srf
+        do i=nx-5, nx
+          if(k >= dom%kc_bot(i)) then
+            volay(k) = volay(k) + dom%vol(i,k)
+            rho_outavg(k) = rho_outavg(k) + dom%vol(i,k)*turbid_density(dom%t(i,k), sum(dom%c(i,k,:)))
+          end if
+
+          !print '(4i4, 7f15.5)', i, k, k_srf, kc_bot(nx), volay(k), rho_outavg(k)
+        end do
+      end do
+
+      do k=1, k_srf
+        rho_outavg(k) = rho_outavg(k)/volay(k)
+      enddo
+
+      ! find kc
       do j=1, dom%n_out
 
         kc = -1
@@ -2524,11 +2642,56 @@ contains
         HSWT = 0.0
         HSWB = 0.0
 
-        KTOP = k_srf
-        KBOT = kc_bot(nx)
-        ! user diffinition mode
-        !KTOP = MAX(KTSW(j), KT)
-        !KBOT = MAX(KBSW(j), KT)
+        ! user diffinition KTSW and KBSW
+        if (ktswkbsw) then
+          KTOP = k_srf
+          KBOT = kc_bot(nx)
+
+          zKTSW = dom%zKTSWs(j)
+          zKTSW = MIN(zKTSW, z_srf)
+          do k= kc, k_srf
+            if (zc(k) >= zKTSW) then
+              KTOP = k-1; exit
+            end if
+          end do
+
+          zKBSW = dom%zKBSWs(j)
+          zKBSW = max(zKBSW, z(kc_bot(nx)))
+          do k= kc_bot(nx), kc
+            if (zKBSW <= zc(k)) then
+              KBOT = k-1; exit
+            end if
+          end do
+
+          !print '(4i4, 7f15.5)', i, k, KBOT, KTOP, zKBSW, ZKTSW
+          
+        else   ! if no input KTSW and KBSW, KTOP and KBOT calc. flow depth of axi-symmetric jet
+          if(abs(rho_outavg(k_srf) - rho_outavg(kc_bot(nx))) > 0.2) then
+            eps = -(rho_outavg(kc+1) - rho_outavg(kc-1))/(z(kc+1) - z(kc-1))/rho_water
+          else 
+            eps = -(rho_outavg(k_srf) - rho_outavg(kc_bot(nx)))/(z(k_srf) - z(kc-1))/rho_water
+          endif
+            eps = max(1.e-8, eps)
+
+          ! flow depth of axi-symmetric jet, m
+          delta = (abs(dom%q_outs(j)) / (dom%fr_outs(j)*(dom%phi_outs(j)*pi/180)*sqrt(eps*gravity)))**0.33333
+          delta = min(max(2*dz(kc), delta), z(nz)-z(0))
+
+          KTOP = kc+1
+          do k= kc, k_srf
+            if (zc(k) >= z_out + delta/2) then
+              KTOP = k; exit
+            end if
+          end do
+
+          KBOT = kc-1
+          do k= kc_bot(nx), kc
+            if (z_out - delta/2 <= zc(k)) then
+              KBOT = k; exit
+            end if
+            !print '(4i4, 7f15.5)', i, k, kc, KBOT, zc(k), z_out - delta/2
+          end do
+        endif
 
         ! coefficient for outflow thickness near the water surface or bottom
         OUTCOEF = 1.0 
@@ -2537,10 +2700,10 @@ contains
         endif
 
         ! outflow zone above structure
-        do k= kc+1, k_srf
+        do k= kc-1, KTOP
           ! Density frequency
           HT = z(k) - z_out
-          RHOFT = MAX(SQRT((ABS(rho(nx,k) - rho(nx,kc)))/(HT*rho(nx,kc) + 1.0E-10)*gravity), 1.0E-10)
+          RHOFT = MAX( SQRT((ABS(rho_outavg(k) - rho_outavg(kc)))/(HT*rho_outavg(kc) + 1.0E-10)*gravity), 1.0E-10 )
 
           ! Thickness of point sink flow
           HSWT = (OUTCOEF*dom%q_outs(j)/RHOFT)**0.333333
@@ -2551,27 +2714,28 @@ contains
             KTOP = k; exit
           end if
         
-          !print '(3i4, 7f10.5)', k_srf, kc_bot(nx), KTOP, OUTCOEF, HT, RHOFT, rho(nx,k), rho(nx,kc), HSWT
+          !print '(4i4, 7f15.5)', k, k_srf, kc_bot(nx), KTOP, z(k), z_out, rho_outavg(k), rho_outavg(kc), HT, RHOFT, HSWT
 
         enddo
 
         ! Reference density of above structure
         if ((z_out + HSWT) < z_srf) THEN
-          DLRHOT = ABS(rho(nx,kc) - rho(nx, KTOP))
+          DLRHOT = ABS(rho_outavg(kc) - rho_outavg(KTOP))
+          SETT=1
         else if (z_srf == z_out) THEN
           DLRHOT = 1.0e-10
+          SETT=2
         else
-          DLRHOT = ABS(rho(nx,kc) - RHO(nx,k_srf))*HSWT/(z_srf-z_out)
+          DLRHOT = ABS(rho_outavg(kc) - rho_outavg(k_srf))*HSWT/(z_srf-z_out)
+          SETT=3
         endif
         DLRHOT = MAX(DLRHOT, 1.0e-10)
-
-        !print '(3i4, 7f10.5)', k_srf, kc_bot(nx), KTOP, OUTCOEF, HT, RHOFT, rho(nx,k), rho(nx,kc), HSWT, DLRHOT
 
         ! outflow zone below structure
         do k= kc-1, kc_bot(nx), -1
           ! Density frequency
           HB = z_out - z(k)
-          RHOFB = MAX(SQRT((ABS(rho(nx,k) - rho(nx,kc)))/(HB*rho(nx,kc) + 1.0E-10)*gravity), 1.0E-10)
+          RHOFB = MAX( SQRT((ABS(rho_outavg(k) - rho_outavg(kc)))/(HB*rho_outavg(kc) + 1.0E-10)*gravity), 1.0E-10 )
 
           ! Thickness of point sink flow
           HSWB = (OUTCOEF*dom%q_outs(j)/RHOFB)**0.333333
@@ -2582,16 +2746,19 @@ contains
             KBOT = k; exit
           end if
           
-          !print '(3i4, 7f10.5)', k, kc_bot(nx), KBOT, OUTCOEF, HB, RHOFB, rho(nx,k), rho(nx,kc), HSWB
+          !print '(4i4, 7f15.5)', k, k_srf, kc_bot(nx), KBOT, z(k), z_out, rho(nx,k), rho(nx,kc), HB, RHOFB, HSWB
         enddo
 
         ! Reference density of below structure
-        if ((z_out + HSWT) < z_srf) THEN
-          DLRHOB = ABS(rho(nx,kc) - rho(nx, KBOT))
-        else if (z(KBOT+1) == z_out) THEN
+        if ((z_out - HSWB) > z(KBOT-1)) then
+          DLRHOB = ABS(rho_outavg(kc) - rho_outavg(KBOT))
+          SETB=1
+        else if (z(KBOT-1) == z_out) then
           DLRHOB = 1.0e-10
+          SETB=2
         else
-          DLRHOB = ABS(rho(nx,kc) - rho(nx,KBOT))*HSWB/(z_out - z(kc_bot(nx)))
+          DLRHOB = ABS(rho_outavg(kc) - rho_outavg(KBOT))*HSWB/(z_out - z(KBOT-1))
+          SETB=3
         endif
         DLRHOB = MAX(DLRHOB, 1.0e-10)
 
@@ -2600,16 +2767,16 @@ contains
         ! Velocity profile 
         VSUM = 0.0
         do k=KBOT, KTOP
-          if(k < kc) then
-            DLRHOMAX = MAX(DLRHOB, 1.0e-10)
-          else
+          if(k > kc) then
             DLRHOMAX = MAX(DLRHOT, 1.0e-10)   
+          else
+            DLRHOMAX = MAX(DLRHOB, 1.0e-10)
           endif
 
-          f(k) = 1.0 - ((rho(nx,kc) - rho(nx,k))/DLRHOMAX)**2
+          f(k) = 1.0 - ((rho_outavg(kc) - rho_outavg(k))/DLRHOMAX)**2
           IF(f(k).GT.1.0) f(k)=1.0  
           IF(f(k).LT.0.0) f(k)=0.0
-          !print '(3i4, 7f10.5)', k, KBOT, KTOP, DLRHOMAX, f(k)
+          !print '(5i4, 7f11.5)', k, KBOT, KTOP, SETT, SETB, DLRHOB, DLRHOT, DLRHOMAX, rho(nx,kc), rho(nx,k), f(k), ((rho(nx,kc) - rho(nx,k))/DLRHOMAX)**2
 
           f(k) = f(k)*dom%au(nx,k)
           VSUM = VSUM + f(k)
@@ -2686,7 +2853,7 @@ contains
 
 
     !--- de-allocate arrays ---
-    deallocate (f, c_, u, q)
+    deallocate (f, c_, u, q, rho_outavg, volay)
     !--------------------------
 
   end subroutine update_outflow
@@ -3545,6 +3712,7 @@ contains
 
     nullify ( &
       dom%surf_outs, dom%z_outs, dom%fr_outs, dom%phi_outs, &
+      dom%out_heights, dom%zKTSWs, dom%zKBSWs, &
       dom%ts_out, dom%q_outs, dom%t_outs, dom%c_outs, &
       dom%t_out, dom%c_out)
 
